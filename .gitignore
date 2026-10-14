@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+evals/ultima_corrida.json
+evals/juicio.json
