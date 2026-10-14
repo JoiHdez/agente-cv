@@ -5,27 +5,44 @@ Agente conversacional que responde preguntas sobre la trayectoria profesional de
 ## Arquitectura
 
 ```
-Cliente (plataforma del reto, curl, cualquier SDK de Responses)
-   │  POST /v1/responses  (Bearer API key · límite por minuto · validación de tamaño)
-   ▼
-app/main.py ── traduce Open Responses ⇄ mensajes (app/openresponses.py), historial por previous_response_id
-   ▼
-app/guardrails.py ── filtro de salida: teléfono, RFC, CURP, CLABE, tarjetas y correos nunca salen (también en streaming)
-   ▼
-app/agente.py ── bucle con herramientas, streaming de texto, máximo de pasos, traza JSON por paso
-   │     system = reglas + resumen del CV (siempre en contexto, en caché)
-   ▼
-LLM ── decide cuándo llamar a buscar_en_cv ──▶ app/conocimiento.py ── BM25 sobre data/perfil/*.md
-                                                     ▲
-app/mcp_server.py ── expone buscar_en_cv y resumen_cv a cualquier cliente MCP (solo lectura)
+                Plataforma del reto (o cualquier cliente de Open Responses)
+                                      │
+                POST /v1/responses · Authorization: Bearer · stream: true
+                                      │
+┌──────────────────────────── Contenedor Docker (Railway) ────────────────────────────┐
+│ ① API FastAPI · app/main.py                                                         │
+│    llave · límite por minuto · tamaño máximo · CORS · rutas compatibles             │
+│    traduce Open Responses ⇄ mensajes (app/openresponses.py) · historial             │
+│                                      │                                              │
+│ ② Filtro de salida · app/guardrails.py  ◀── todo lo que sale pasa por aquí         │
+│                                      │                                              │
+│ ③ Agente · app/agente.py                                                            │
+│    routing: pregunta directa ─▶ modelo rápido · análisis ─▶ modelo avanzado         │
+│    bucle con herramientas · máximo 5 pasos · traza por paso · fallback entre modelos │
+│    reglas + resumen del CV en caché                                                 │
+│                                      │                                              │
+│ ④ Herramienta buscar_en_cv · app/conocimiento.py + app/rag.py                       │
+│    BM25 sobre data/perfil/*.md (solo información pública)                           │
+│                                                                                     │
+│ ⑤ Servidor MCP · app/mcp_server.py · la misma base para otros agentes, solo lectura │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Recorrido de una pregunta
+
+1. La plataforma manda `POST /v1/responses` con la conversación y la llave.
+2. La API valida llave, límite y tamaño; traduce el formato y registra la forma de la petición (campos, streaming, historial), nunca su contenido.
+3. El agente elige el modelo: rápido para preguntas directas, avanzado para análisis o detalle técnico.
+4. El modelo lee las reglas y el resumen (en caché) y, si necesita detalle, llama a `buscar_en_cv`.
+5. La herramienta busca con BM25 y devuelve los fragmentos relevantes; el modelo responde con esa información.
+6. El texto sale en streaming a través del filtro de datos personales, con los eventos de cierre del estándar y `[DONE]`.
 
 ## Decisiones
 
 | Decisión | Alternativas descartadas | Por qué |
 |---|---|---|
 | **Resumen siempre en contexto + detalle bajo demanda con una herramienta** | Meter todo el CV en el prompt; RAG puro | El resumen (~1,000 tokens) responde la mayoría de preguntas sin buscar. El detalle por empresa o proyecto se recupera solo cuando hace falta: menos tokens por pregunta, el detalle exacto de cada empresa o proyecto y la base puede crecer sin inflar el prompt. |
-| **Búsqueda BM25 con raíces simples** | Embeddings + base vectorial | Determinista, sin dependencias ni costo, explicable. Con 6 secciones alcanza un hit@3 de 92%. El caso que falla ("costo de usar LLMs") es justo el que resuelve la búsqueda semántica: es el siguiente paso. |
+| **Búsqueda BM25 con raíces simples** | Embeddings + base vectorial | Determinista, sin dependencias ni costo, explicable. Con 6 secciones alcanza un hit@3 de 90% en 20 preguntas. Los casos que fallan (sinónimos, como "¿cuándo termina la carrera?") son justo los que resuelve la búsqueda semántica: es el siguiente paso. |
 | **Bucle de agente propio** | Frameworks (LangGraph) o el tool runner del SDK | Control total y auditable: límite de pasos, validación de los argumentos de la herramienta, traza por paso y pruebas con un cliente falso. |
 | **Streaming real** | Generar todo y luego "simular" el streaming | El texto llega a la plataforma mientras el modelo escribe (`response.output_text.delta`), con los eventos de ciclo de vida que pide el spec. |
 | **Reglas antes que las instrucciones del cliente** | Pasar `instructions` como system prompt | Las indicaciones del cliente se agregan después de las reglas y no pueden anularlas; lo que escribe el usuario o devuelve la herramienta se trata como datos (defensa contra prompt injection). |
@@ -41,8 +58,8 @@ app/mcp_server.py ── expone buscar_en_cv y resumen_cv a cualquier cliente MC
 
 | Comando | Qué mide | Resultado |
 |---|---|---|
-| `pytest -q` | Protocolo Open Responses (formato, orden de eventos SSE, `[DONE]`), historial, API key, límite de peticiones, bucle del agente con cliente falso, caché y filtro de datos personales (incluido un dato partido entre fragmentos) | 13 pruebas, sin red |
-| `python -m evals.run_evals` | Recuperación: ¿la búsqueda trae la sección correcta? | hit@3 = 92% |
+| `pytest -q` | Protocolo Open Responses (formato, orden de eventos SSE, `[DONE]`), historial, API key, límite de peticiones, bucle del agente con cliente falso, caché, filtro de datos personales, routing, fallback y compatibilidad de rutas y llaves (incluido un dato partido entre fragmentos) | 18 pruebas, sin red |
+| `python -m evals.run_evals` | Recuperación: ¿la búsqueda trae la sección correcta? | hit@3 = 90% (18 de 20) |
 | `python -m evals.run_evals --e2e` | De punta a punta contra el modelo: datos clave, sin revelar fuentes internas (archivos o fragmentos), preguntas reformuladas, y **casos adversarios**: pedir teléfono o sueldo, prompt injection, preguntas fuera de tema y preguntas sin dato | 34 de 34 (100%); 79% de los tokens de entrada salieron de caché |
 | `python -m evals.juez` | LLM como juez con rúbrica (exactitud, relevancia, privacidad, sin fuentes, seguridad) usando el CV completo como verdad; reporta su concordancia con la verificación por palabras clave | 33 de 34 (97%); exactitud 4.8/5, relevancia 4.9/5 |
 
@@ -93,6 +110,14 @@ curl -N localhost:8000/v1/responses -H "Authorization: Bearer $AGENT_API_KEY" -H
 Con Docker: `docker build -t agente-cv . && docker run -p 8000:8000 --env-file .env agente-cv`.
 
 Despliegue: cualquier plataforma que construya el `Dockerfile` (por ejemplo Railway), con `ANTHROPIC_API_KEY` y `AGENT_API_KEY` como variables de entorno. La URL pública del endpoint es `https://<dominio>/v1/responses`.
+
+## Trade-offs aceptados
+
+- **Historial y límites en memoria:** suficiente para una réplica; con varias, Redis con TTL.
+- **Routing por palabras clave:** simple y medible (30 de 34 preguntas al modelo rápido sin perder exactitud); si se equivoca seguido, un clasificador medido con las evals.
+- **Un solo proveedor:** bien integrado y probado, con fallback entre modelos; un segundo proveedor es el siguiente paso.
+- **BM25:** rápido y explicable, pero falla con sinónimos ("¿cuándo termina la carrera?"); lo resuelve la búsqueda híbrida.
+- **Docker en Railway:** simple de operar para el reto; el mismo contenedor corre en Kubernetes.
 
 ## Límites conocidos y siguientes pasos
 
